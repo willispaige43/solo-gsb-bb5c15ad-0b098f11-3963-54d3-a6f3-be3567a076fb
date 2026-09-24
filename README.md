@@ -77,6 +77,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/jobs/{job_id}/dicomdir/download` | 下载带 **DICOMDIR** 的离线阅片 ZIP：按匿名伪名 / Study/Series/SOP UID 重建四级目录层级，实例映射为合规稳定短 File ID |
 | `GET` | `/jobs/{job_id}/studies/{study_instance_uid}/download` | 按**匿名 StudyInstanceUID** 下载检查子集（递归补全 SOP 引用闭包，含跨检查引用） |
 | `GET` | `/jobs/{job_id}/series/{series_instance_uid}/geometry` | 按**匿名 SeriesInstanceUID** 分析单帧切片几何：方向余弦叉积法线、投影排序、中位数层间距与 `>1.5×` 异常缺口标记，冲突时返回含匿名 SOP UID 的明细 |
+| `GET` | `/jobs/{job_id}/series/{series_instance_uid}/ct-voltage` | 按**匿名 SeriesInstanceUID** 逐帧统计 CT 管电压（KVP）分布：各电压帧数、缺失帧数与按匿名 SOP UID 排列的实例明细，便于发现同系列混用扫描参数 |
 | `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/preview.png` | 按**匿名 SOPInstanceUID** 返回实例影像的 8 位灰度 **PNG 预览**（未压缩、单帧、8/16 位 MONOCHROME1/2），供人工核对影像内容 |
 | `GET` | `/health` | 健康检查 |
 
@@ -520,6 +521,136 @@ else:
         print("中位层间距：", g["median_spacing"], "mm")
         print("异常间隙：",
               [g["spacings"][i] for i in g["anomalous_gap_indices"]])
+```
+
+### CT 管电压（KVP）逐帧分布（`GET /jobs/{job_id}/series/{series_instance_uid}/ct-voltage`）
+
+同一台 CT 检查中，一个系列可能因扫描方案切换（如定位像 + 增强扫描、
+不同期相重建到同一系列）而**混用不同管电压**，这类系列直接用于重建/定量分析
+前需要被发现。本接口按**匿名 SeriesInstanceUID** 逐帧统计管电压（KVP，
+DICOM `(0018,0060)`）分布。数据**只读取已完成任务 output 目录中的匿名
+DICOM 文件**，不重新解压或处理原始 ZIP。
+
+`series_instance_uid` 必须是任务结果中的**匿名后** UID，取自 `GET /jobs/{id}`
+响应里的 `series[].new_series_instance_uid`（或某文件的 `series_instance_uid`）。
+
+**逐帧取值优先级**（每帧独立判定，同时支持 Classic CT 与 Enhanced CT IOD）：
+
+1. 该帧在 `PerFrameFunctionalGroupsSequence` 中对应数据项的
+   `CTExposureSequence[].KVP`（多帧增强 CT 的逐帧曝光参数，**最优先**）；
+2. `SharedFunctionalGroupsSequence` 内 `CTExposureSequence[].KVP`
+   （全部帧共享的曝光参数）；
+3. 数据集顶层 `KVP`（Classic CT Image，单帧文件的常见位置）。
+
+三处都没有有效 KVP（缺失 / 空值 / 不可解析 / 非正数）的帧计入
+**缺失值帧数** `missing_kvp_frame_count`，缺失本身**不是错误**——
+它是需要暴露的分布信息。**单帧文件**（`NumberOfFrames` 缺省或为 1）
+按一帧处理。
+
+成功响应（200）字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `frame_count` | 系列逐帧解析的总帧数 |
+| `missing_kvp_frame_count` | 三处来源均无有效管电压的帧数 |
+| `distinct_kvp_count` | 出现的不同管电压取值数（不含缺失） |
+| `mixed_voltage` | 是否存在 ≥2 种管电压（同系列混用扫描参数的快速判据） |
+| `kvp_distribution[]` | 全系列各管电压 `{kvp, frame_count}`，按电压升序（不含缺失帧） |
+| `instances[]` | 按**匿名 SOPInstanceUID 字典序**排列的实例明细 |
+| `instances[].declared_frame_count` / `frame_count` | 声明帧数与实际解析帧数 |
+| `instances[].kvp_values[]` | 逐帧管电压（kV），缺失帧为 `null` |
+| `instances[].kvp_sources[]` | 逐帧取值来源（`per_frame_functional_groups` / `shared_functional_groups` / `top_level`），缺失帧为 `null` |
+| `instances[].kvp_distribution[]` | 该实例内各电压帧数 |
+| `instances[].missing_kvp_frame_indices[]` | 缺失 KVP 的 0 基帧序号 |
+
+```bash
+# 8) 取某个匿名 SeriesInstanceUID，查看逐帧管电压分布
+SERIES_UID=$(python3 -c "import json;print(json.load(open('job.json'))['series'][0]['new_series_instance_uid'])")
+
+curl -f "http://localhost:8000/jobs/$JOB_ID/series/$SERIES_UID/ct-voltage" | python3 -m json.tool
+```
+
+```jsonc
+{
+  "series_instance_uid": "2.25.1695…",
+  "instance_count": 3,
+  "frame_count": 5,                      // 2 个单帧 + 1 个 3 帧多帧
+  "missing_kvp_frame_count": 1,
+  "distinct_kvp_count": 2,
+  "mixed_voltage": true,                 // 同系列混用 80/120 kV
+  "kvp_distribution": [
+    {"kvp": 80.0, "frame_count": 1},
+    {"kvp": 120.0, "frame_count": 3}
+  ],
+  "instances": [
+    {"sop_instance_uid": "2.25.1111…", "output_file": "2.25.1111….dcm",
+     "modality": "CT", "declared_frame_count": 1, "frame_count": 1,
+     "missing_kvp_frame_count": 0, "missing_kvp_frame_indices": [],
+     "kvp_values": [120.0], "kvp_sources": ["top_level"],
+     "kvp_distribution": [{"kvp": 120.0, "frame_count": 1}]},
+    {"sop_instance_uid": "2.25.2222…", "output_file": "2.25.2222….dcm",
+     "modality": "CT", "declared_frame_count": 3, "frame_count": 3,
+     "missing_kvp_frame_count": 1, "missing_kvp_frame_indices": [2],
+     "kvp_values": [120.0, 80.0, null],
+     // 第 3 帧逐帧组无 KVP、无共享组、顶层也无 -> null（计入缺失）
+     "kvp_sources": ["per_frame_functional_groups",
+                     "per_frame_functional_groups", null],
+     "kvp_distribution": [
+       {"kvp": 80.0, "frame_count": 1},
+       {"kvp": 120.0, "frame_count": 1}]}
+  ]
+}
+```
+
+出现以下任一**结构性**问题时接口**不给出不完整统计**，而是返回 `409`
+（`detail.code = CT_VOLTAGE_CONFLICT`），在 `detail.problems[]` 中
+**一次性列出全部冲突，每条都带匿名 SOP UID**（绝不回显原始 UID）：
+
+| `reason` | 触发条件 |
+| --- | --- |
+| `frame_count_mismatch` | `NumberOfFrames` 声明帧数与 `PerFrameFunctionalGroupsSequence` 数据项数不符（含声明 1 帧却给出多个逐帧数据项；`declared_frame_count` / `per_frame_sequence_length` / `number_of_frames` 给出两边数值与原始文本），无法逐帧对齐曝光参数 |
+| `ambiguous_output` | 同一匿名 SOPInstanceUID 对应多份物理输出（`output_files` 列出冲突文件），不猜测、不挑选 |
+| `unreadable` | 匿名输出存在但无法作为 DICOM 读取（损坏 / 截断 / 编码错误） |
+| `output_missing` | 任务记录有该输出但磁盘文件已不存在 |
+
+> 说明：单帧文件（`NumberOfFrames` 缺省/为 1）且没有
+> `PerFrameFunctionalGroupsSequence`（或为空序列）时按一帧走共享/顶层
+> 回退，不算帧数冲突；但声明 1 帧却带多个逐帧数据项属于结构不自洽，
+> 仍报 `frame_count_mismatch`。KVP 取值缺失（含非 CT 对象没有 `KVP`
+> 标签）只计入 `missing_kvp_frame_count`，不属于冲突。
+
+任务不存在 / 已过期返回 `404`（`JOB_NOT_FOUND`）；任务未完成返回 `409`
+（`JOB_NOT_READY`）；该匿名系列在任务成功输出中不存在（含全部文件失败）
+返回 `404`（`SERIES_NOT_FOUND`）。
+
+Python 示例（含 404/409 处理）：
+
+```python
+resp = requests.get(
+    f"http://localhost:8000/jobs/{job_id}/series/{anon_series_uid}/ct-voltage"
+)
+if resp.status_code == 404:
+    print("任务或匿名系列不存在：", resp.json()["detail"]["code"])
+elif resp.status_code == 409:
+    detail = resp.json()["detail"]
+    if detail["code"] == "JOB_NOT_READY":
+        print("任务未完成：", detail["message"])
+    else:
+        print("管电压统计冲突：", detail["code"])
+        for p in detail["problems"]:
+            # reason: frame_count_mismatch | ambiguous_output |
+            #         unreadable | output_missing
+            print(p["reason"], p["sop_instance_uid"],
+                  p.get("declared_frame_count"),
+                  p.get("per_frame_sequence_length"))
+else:
+    resp.raise_for_status()
+    report = resp.json()
+    print("总帧数：", report["frame_count"],
+          "缺失：", report["missing_kvp_frame_count"])
+    print("混用扫描参数：", report["mixed_voltage"])
+    for item in report["kvp_distribution"]:
+        print(f"{item['kvp']} kV: {item['frame_count']} 帧")
 ```
 
 ### 跨任务合并下载同一匿名检查（`POST /jobs/merged-study/download`）
@@ -1060,11 +1191,12 @@ else:
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集下载、系列几何、实例 PNG 预览、/health）
+│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集下载、系列几何、CT 管电压分布、实例 PNG 预览、/health）
 │   ├── anonymizer.py    # 两遍扫描引擎：UID 映射、标签重写、递归序列、诊断、ZIP 打包
 │   ├── preview.py       # 按匿名 SOP UID 从成功输出渲染单帧 8 位灰度 PNG：Rescale→VOI 窗/极值拉伸→MONOCHROME1 反相
 │   ├── dicomdir.py      # 从匿名输出重建 DICOMDIR 四级层级、稳定短 File ID、引用校验与阅片 ZIP
 │   ├── geometry.py      # 系列单帧切片几何：方向余弦叉积法线、投影排序、中位数层间距与 >1.5× 缺口标记
+│   ├── ct_voltage.py    # 系列 CT 管电压（KVP）逐帧分布：逐帧/共享功能组/顶层三级回退、缺失帧数、混用判据与冲突
 │   ├── study_subset.py  # 按匿名 StudyInstanceUID 的引用闭包解析与子集 ZIP（复用匿名输出）
 │   ├── merged_study.py  # 跨 2～5 个同密钥任务的检查合并：跨任务引用闭包、字节去重/冲突/缺失 409
 │   ├── consistency.py   # 跨任务一致性核对：密钥指纹/患者伪名/UID 映射比对与差异明细分页
@@ -1072,9 +1204,9 @@ else:
 │   ├── crypto.py        # HMAC 确定性派生：伪名、UID、日期偏移
 │   ├── tags.py          # Annex E 标签策略与参与一致性重写的 UID 标签集合
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
-│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR/预览/几何错误模型）
+│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR/预览/几何/管电压错误模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何（209 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何 / CT 管电压分布（235 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

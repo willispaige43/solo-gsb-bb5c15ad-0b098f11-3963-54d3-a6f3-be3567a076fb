@@ -657,3 +657,104 @@ class MergedStudyErrorDetail(BaseModel):
         default=[],
         description="引用目标在所有指定任务成功输出中均不存在的匿名 UID 列表",
     )
+
+
+# --------------------------------------------------------------------------- #
+# CT 管电压（KVP）逐帧分布（GET /jobs/{id}/series/{uid}/ct-voltage）
+# --------------------------------------------------------------------------- #
+class CtVoltageCountItem(BaseModel):
+    kvp: float = Field(description="管电压峰值（kV，取自 DICOM KVP (0018,0060)）")
+    frame_count: int = Field(description="该管电压对应的帧数")
+
+
+class CtVoltageInstanceItem(BaseModel):
+    sop_instance_uid: str = Field(description="该实例的匿名 SOPInstanceUID")
+    output_file: str = Field(description="任务 output 目录内的扁平匿名文件名")
+    modality: Optional[str] = Field(
+        default=None, description="实例 Modality（如 CT）；标签缺失时为 null"
+    )
+    declared_frame_count: int = Field(
+        description="NumberOfFrames 声明帧数；缺省/非法时按 1 处理"
+    )
+    frame_count: int = Field(description="实际逐帧解析的帧数（单帧文件为 1）")
+    missing_kvp_frame_count: int = Field(description="该实例缺失 KVP 的帧数")
+    missing_kvp_frame_indices: list[int] = Field(
+        description="缺失 KVP 的 0 基帧序号列表"
+    )
+    kvp_values: list[Optional[float]] = Field(
+        description="逐帧管电压（kV），按帧序号排列；缺失帧为 null"
+    )
+    kvp_sources: list[Optional[str]] = Field(
+        description=(
+            "逐帧 KVP 取值来源，与 kvp_values 一一对应："
+            "per_frame_functional_groups | shared_functional_groups | top_level；"
+            "缺失帧为 null"
+        )
+    )
+    kvp_distribution: list[CtVoltageCountItem] = Field(
+        description="该实例内各管电压的帧数（不含缺失帧）"
+    )
+
+
+class SeriesCtVoltageOut(BaseModel):
+    series_instance_uid: str = Field(description="请求的匿名 SeriesInstanceUID")
+    instance_count: int = Field(description="参与统计的成功输出实例数")
+    frame_count: int = Field(description="系列逐帧解析的总帧数")
+    missing_kvp_frame_count: int = Field(
+        description="三处来源（逐帧 CTExposureSequence / 共享功能组 / 顶层 KVP）"
+                    "均无有效管电压的帧数"
+    )
+    distinct_kvp_count: int = Field(description="系列内出现的不同管电压取值数（不含缺失）")
+    mixed_voltage: bool = Field(
+        description="系列内是否存在 2 种及以上管电压（同系列混用扫描参数的快速判据）"
+    )
+    kvp_distribution: list[CtVoltageCountItem] = Field(
+        description="全系列各管电压（kV）的帧数，按管电压升序排列（不含缺失帧）"
+    )
+    instances: list[CtVoltageInstanceItem] = Field(
+        description="按匿名 SOPInstanceUID 字典序排列的实例逐帧明细"
+    )
+
+
+class CtVoltageProblemItem(BaseModel):
+    sop_instance_uid: str = Field(description="出问题实例的匿名 SOPInstanceUID")
+    output_file: Optional[str] = Field(
+        default=None, description="可定位时给出任务 output 目录内的扁平文件名"
+    )
+    output_files: list[str] = Field(
+        default=[], description="ambiguous_output 时给出相互冲突的输出文件名"
+    )
+    reason: str = Field(
+        description=(
+            "frame_count_mismatch（NumberOfFrames 声明数与 "
+            "PerFrameFunctionalGroupsSequence 长度不符，含声明 1 帧却给出多个逐帧数据项） | "
+            "ambiguous_output（同一匿名 SOP UID 对应多份输出） | "
+            "unreadable（匿名输出不可读） | output_missing（磁盘文件缺失）"
+        )
+    )
+    declared_frame_count: Optional[int] = Field(
+        default=None, description="frame_count_mismatch 时的声明帧数"
+    )
+    per_frame_sequence_length: Optional[int] = Field(
+        default=None,
+        description="frame_count_mismatch 时 PerFrameFunctionalGroupsSequence 的实际长度",
+    )
+    number_of_frames: Optional[str] = Field(
+        default=None, description="frame_count_mismatch 时文件中 NumberOfFrames 的原始文本"
+    )
+    message: str
+
+
+class CtVoltageErrorDetail(BaseModel):
+    code: str = Field(
+        description="SERIES_NOT_FOUND（404） | JOB_NOT_READY（409） | CT_VOLTAGE_CONFLICT（409）"
+    )
+    message: str
+    series_instance_uid: Optional[str] = None
+    instance_count: Optional[int] = Field(
+        default=None, description="CT_VOLTAGE_CONFLICT 时已成功解析的实例数"
+    )
+    conflict_count: Optional[int] = Field(
+        default=None, description="CT_VOLTAGE_CONFLICT 时的冲突明细条数"
+    )
+    problems: list[CtVoltageProblemItem] = []
