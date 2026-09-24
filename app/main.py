@@ -16,6 +16,7 @@ from . import (
     consistency,
     dicomdir,
     geometry,
+    kvp,
     merged_study,
     pagination,
     preview,
@@ -33,11 +34,13 @@ from .schemas import (
     FileOut,
     GeometryErrorDetail,
     JobOut,
+    KvpErrorDetail,
     MergedStudyDownloadRequest,
     MergedStudyErrorDetail,
     PatientOut,
     PreviewErrorDetail,
     SeriesGeometryOut,
+    SeriesKvpOut,
     SeriesOut,
     StudyOut,
     StudySubsetErrorDetail,
@@ -62,6 +65,7 @@ app = FastAPI(
         "支持按匿名检查下载子集、跨多个同密钥任务合并下载同一检查、"
         "生成带 DICOMDIR 的离线阅片 ZIP、"
         "按匿名 SOPInstanceUID 渲染单帧灰度 PNG 预览供人工核对，"
+        "按匿名 SeriesInstanceUID 统计 CT 管电压（KVP）逐帧分布以发现混用扫描参数，"
         "并支持对多个已完成任务做跨批次密钥指纹/伪名/UID 映射一致性核对。"
     ),
     lifespan=lifespan,
@@ -618,6 +622,53 @@ def get_series_geometry(job_id: str, series_instance_uid: str) -> SeriesGeometry
 
 
 @app.get(
+    "/jobs/{job_id}/series/{series_instance_uid}/kvp",
+    response_model=SeriesKvpOut,
+    tags=["jobs"],
+    summary=(
+        "按匿名 SeriesInstanceUID 统计 CT 管电压（KVP）逐帧分布："
+        "各电压帧数、缺失帧数与逐实例明细"
+    ),
+    responses={
+        404: {"model": KvpErrorDetail,
+              "description": "任务不存在/已过期，或该匿名系列不在任务的成功输出中"},
+        409: {"model": KvpErrorDetail,
+              "description": "任务未完成，或 KVP 统计冲突：NumberOfFrames 声明帧数与 "
+                             "PerFrameFunctionalGroupsSequence 条目数不符、"
+                             "NumberOfFrames 取值非法、同一匿名 SOP UID 对应多份输出、"
+                             "匿名输出不可读/缺失"},
+    },
+)
+def get_series_kvp(job_id: str, series_instance_uid: str) -> SeriesKvpOut:
+    job = registry.get(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "JOB_NOT_FOUND",
+                "message": "任务不存在或已过期",
+                "series_instance_uid": series_instance_uid,
+            },
+        )
+    if job.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "JOB_NOT_READY",
+                "message": f"任务处理失败：{job.error}",
+                "series_instance_uid": series_instance_uid,
+            },
+        )
+
+    try:
+        report = kvp.analyze_series_kvp(job, series_instance_uid)
+    except kvp.KvpError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.detail) from exc
+
+    return SeriesKvpOut.model_validate(report)
+
+
+@app.get(
     "/jobs/{job_id}/instances/{sop_instance_uid}/preview.png",
     tags=["jobs"],
     response_class=Response,
@@ -744,6 +795,7 @@ def root() -> dict:
             "GET /jobs/{job_id}/dicomdir/download",
             "GET /jobs/{job_id}/studies/{study_instance_uid}/download",
             "GET /jobs/{job_id}/series/{series_instance_uid}/geometry",
+            "GET /jobs/{job_id}/series/{series_instance_uid}/kvp",
             "GET /jobs/{job_id}/instances/{sop_instance_uid}/preview.png",
             "GET /health",
         ],

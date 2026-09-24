@@ -578,6 +578,92 @@ class GeometryErrorDetail(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# 系列 CT 管电压（KVP）逐帧分布（GET /jobs/{id}/series/{uid}/kvp）
+# --------------------------------------------------------------------------- #
+class KvpVoltageBucket(BaseModel):
+    kvp: float = Field(description="管电压（kV）")
+    frame_count: int = Field(description="该电压的帧数")
+
+
+class KvpInstanceItem(BaseModel):
+    sop_instance_uid: str = Field(description="匿名 SOPInstanceUID")
+    output_file: Optional[str] = Field(
+        default=None, description="任务 output 目录内的扁平文件名"
+    )
+    number_of_frames: int = Field(
+        description="声明帧数（NumberOfFrames 缺省按 1；单帧文件按一帧处理）"
+    )
+    kvp_source: str = Field(
+        description="per_frame（逐帧功能组） | shared（共享功能组） | "
+        "top_level（顶层 KVP） | mixed（帧间来源不一致） | none（无任何 KVP）"
+    )
+    frame_kvps: list[Optional[float]] = Field(
+        description="逐帧 KVP（kV），与帧顺序一致；null 表示该帧缺失/无法解析"
+    )
+    missing_kvp_frames: int = Field(description="本实例缺失 KVP 的帧数")
+
+
+class SeriesKvpOut(BaseModel):
+    series_instance_uid: str = Field(description="请求的匿名 SeriesInstanceUID")
+    instance_count: int = Field(description="纳入统计的实例数")
+    total_frames: int = Field(description="纳入统计的总帧数")
+    missing_kvp_frames: int = Field(description="全系列缺失 KVP 的帧数")
+    mixed_kvp: bool = Field(
+        description="系列内是否混用多种管电压（distinct KVP > 1），"
+        "用于发现同系列混用扫描参数"
+    )
+    voltage_distribution: list[KvpVoltageBucket] = Field(
+        description="各管电压的帧数分布，按 kV 升序"
+    )
+    instances: list[KvpInstanceItem] = Field(
+        description="逐实例明细，按匿名 SOPInstanceUID 字典序排列"
+    )
+
+
+class KvpProblemItem(BaseModel):
+    sop_instance_uid: Optional[str] = Field(
+        default=None, description="出问题实例的匿名 SOPInstanceUID（歧义时为该共同 UID）"
+    )
+    output_file: Optional[str] = Field(
+        default=None, description="可定位时给出任务 output 目录内的扁平文件名"
+    )
+    output_files: list[str] = Field(
+        default=[], description="ambiguous_output 时给出相互冲突的输出文件名"
+    )
+    reason: str = Field(
+        description=(
+            "frame_count_mismatch（NumberOfFrames 声明帧数与 "
+            "PerFrameFunctionalGroupsSequence 条目数不一致） | "
+            "invalid_number_of_frames（NumberOfFrames 取值非法） | "
+            "ambiguous_output（同一匿名 SOP UID 对应多份输出） | "
+            "unreadable（匿名输出不可读） | output_missing（磁盘文件缺失）"
+        )
+    )
+    declared_number_of_frames: Optional[str] = Field(
+        default=None,
+        description="frame_count_mismatch / invalid_number_of_frames 时的声明帧数原文",
+    )
+    per_frame_item_count: Optional[int] = Field(
+        default=None,
+        description="frame_count_mismatch 时 PerFrameFunctionalGroupsSequence 的条目数",
+    )
+    message: str
+
+
+class KvpErrorDetail(BaseModel):
+    code: str = Field(
+        description="SERIES_NOT_FOUND（404） | JOB_NOT_READY（409） | "
+        "SERIES_KVP_CONFLICT（409）"
+    )
+    message: str
+    series_instance_uid: Optional[str] = None
+    conflict_count: Optional[int] = Field(
+        default=None, description="SERIES_KVP_CONFLICT 时的冲突明细条数"
+    )
+    problems: list[KvpProblemItem] = []
+
+
+# --------------------------------------------------------------------------- #
 # 跨任务合并下载单个匿名检查（POST /jobs/merged-study/download）
 # --------------------------------------------------------------------------- #
 class MergedStudyDownloadRequest(BaseModel):
